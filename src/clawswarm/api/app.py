@@ -1,6 +1,7 @@
 """FastAPI application for ClawSwarm orchestrator."""
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -172,6 +173,51 @@ def create_app() -> FastAPI:
             if await manager.kill_agent(agent.id):
                 killed += 1
         return {"status": "complete", "killed": killed}
+
+    # --- Agent Callbacks (called by agents) ---
+
+    @app.post("/callback/{agent_id}/result")
+    async def agent_callback_result(agent_id: str, result: TaskResult):
+        """Receive result callback from an agent."""
+        manager = get_manager()
+        agent = await manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        # Update agent with result
+        agent.result = result.result
+        agent.status = "idle"
+        agent.last_activity = datetime.utcnow()
+        
+        return {"status": "received", "agent_id": agent_id}
+
+    @app.post("/callback/{agent_id}/heartbeat")
+    async def agent_callback_heartbeat(agent_id: str):
+        """Receive heartbeat from an agent."""
+        manager = get_manager()
+        agent = await manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        agent.last_activity = datetime.utcnow()
+        return {"status": "ok"}
+
+    # --- Wait for Agent ---
+
+    @app.get("/agents/{agent_id}/wait")
+    async def wait_for_agent(agent_id: str, timeout: float = 30.0):
+        """Wait for an agent to become healthy."""
+        manager = get_manager()
+        agent = await manager.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        healthy = await manager.wait_for_agent(agent_id, timeout)
+        return {
+            "agent_id": agent_id,
+            "healthy": healthy,
+            "status": agent.status.value if agent else "unknown"
+        }
 
     return app
 

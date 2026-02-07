@@ -1,12 +1,14 @@
 """Docker container manager for OpenClaw agents."""
 
 import asyncio
+import os
 import uuid
 from datetime import datetime
 from typing import Optional
 
 import docker
 from docker.errors import NotFound, APIError
+import httpx
 
 from ..models import Agent, AgentConfig, AgentStatus, AgentType
 
@@ -14,17 +16,29 @@ from ..models import Agent, AgentConfig, AgentStatus, AgentType
 class DockerManager:
     """Manages Docker containers for OpenClaw agents."""
 
-    OPENCLAW_IMAGE = "openclaw/openclaw:latest"  # TODO: Build/publish this
+    AGENT_IMAGE = "clawswarm-agent:latest"
     CONTAINER_PREFIX = "clawswarm-agent-"
+    AGENT_PORT = 8421  # Internal port agents listen on
+    
+    # Port range for agent HTTP APIs
+    _next_port = 8500
 
     def __init__(self):
         self.client = docker.from_env()
         self._agents: dict[str, Agent] = {}
+        self._port_map: dict[str, int] = {}  # agent_id -> host_port
+
+    def _get_next_port(self) -> int:
+        """Get next available port for agent."""
+        port = DockerManager._next_port
+        DockerManager._next_port += 1
+        return port
 
     async def spawn_agent(self, config: AgentConfig) -> Agent:
         """Spawn a new agent container."""
         agent_id = str(uuid.uuid4())[:8]
         agent_name = config.name or f"{config.type.value}-{agent_id}"
+        host_port = self._get_next_port()
         
         # Create agent record
         agent = Agent(
@@ -35,33 +49,46 @@ class DockerManager:
             task=config.task,
         )
         self._agents[agent_id] = agent
+        self._port_map[agent_id] = host_port
 
         try:
             # Get soul template for agent type
             soul_content = config.soul_override or self._get_soul_template(config.type)
             
+            # Get API keys from environment
+            openai_key = os.environ.get("OPENAI_API_KEY", "")
+            anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            
+            # Build environment
+            env = {
+                "AGENT_ID": agent_id,
+                "AGENT_NAME": agent_name,
+                "AGENT_TYPE": config.type.value,
+                "AGENT_TASK": config.task or "",
+                "AGENT_SOUL": soul_content,
+                "ORCHESTRATOR_URL": f"http://host.docker.internal:8420",
+                "OPENAI_API_KEY": openai_key,
+                "ANTHROPIC_API_KEY": anthropic_key,
+            }
+            
             # Create container
             container = self.client.containers.run(
-                self.OPENCLAW_IMAGE,
+                self.AGENT_IMAGE,
                 detach=True,
                 name=f"{self.CONTAINER_PREFIX}{agent_id}",
-                environment={
-                    "OPENCLAW_AGENT_ID": agent_id,
-                    "OPENCLAW_AGENT_NAME": agent_name,
-                    "OPENCLAW_AGENT_TYPE": config.type.value,
-                    "OPENCLAW_TASK": config.task or "",
-                    "OPENCLAW_SOUL": soul_content,
-                },
+                environment=env,
+                ports={f"{self.AGENT_PORT}/tcp": host_port},
                 labels={
                     "clawswarm.agent_id": agent_id,
                     "clawswarm.agent_type": config.type.value,
                     "clawswarm.managed": "true",
+                    "clawswarm.host_port": str(host_port),
                 },
                 # Resource limits
                 mem_limit="2g",
                 cpu_quota=100000,  # 1 CPU
-                # Networking
-                network_mode="bridge",
+                # Allow access to host for callbacks
+                extra_hosts={"host.docker.internal": "host-gateway"},
             )
             
             agent.container_id = container.id
@@ -122,21 +149,83 @@ class DockerManager:
         return list(self._agents.values())
 
     async def send_task(self, agent_id: str, task: str) -> bool:
-        """Send a task to an agent via its API."""
+        """Send a task to an agent via its HTTP API."""
         agent = self._agents.get(agent_id)
         if not agent or agent.status != AgentStatus.RUNNING:
             return False
+        
+        host_port = self._port_map.get(agent_id)
+        if not host_port:
+            return False
             
-        # TODO: Implement task sending via agent's API
-        agent.task = task
-        agent.status = AgentStatus.BUSY
-        agent.last_activity = datetime.utcnow()
-        return True
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"http://localhost:{host_port}/task",
+                    json={"task": task}
+                )
+                if response.status_code == 200:
+                    agent.task = task
+                    agent.status = AgentStatus.BUSY
+                    agent.last_activity = datetime.utcnow()
+                    return True
+                return False
+        except Exception as e:
+            agent.error = str(e)
+            return False
 
     async def get_result(self, agent_id: str) -> Optional[str]:
-        """Get the result from an agent."""
+        """Get the result from an agent via HTTP."""
         agent = self._agents.get(agent_id)
-        return agent.result if agent else None
+        if not agent:
+            return None
+            
+        host_port = self._port_map.get(agent_id)
+        if not host_port:
+            return agent.result
+            
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"http://localhost:{host_port}/status")
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("result"):
+                        agent.result = data["result"]
+                    if data.get("status"):
+                        status_str = data["status"]
+                        if status_str == "idle":
+                            agent.status = AgentStatus.RUNNING
+                        elif status_str == "busy":
+                            agent.status = AgentStatus.BUSY
+                        elif status_str == "completed":
+                            agent.status = AgentStatus.IDLE
+        except Exception:
+            pass
+            
+        return agent.result
+    
+    async def health_check(self, agent_id: str) -> bool:
+        """Check if agent is healthy via HTTP."""
+        host_port = self._port_map.get(agent_id)
+        if not host_port:
+            return False
+            
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"http://localhost:{host_port}/health")
+                return response.status_code == 200
+        except Exception:
+            return False
+    
+    async def wait_for_agent(self, agent_id: str, timeout: float = 30.0) -> bool:
+        """Wait for agent to become healthy."""
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            if await self.health_check(agent_id):
+                return True
+            await asyncio.sleep(1)
+        return False
 
     def _get_soul_template(self, agent_type: AgentType) -> str:
         """Get the SOUL.md template for an agent type."""
